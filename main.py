@@ -34,7 +34,7 @@ def init_customers():
     
     customers['test_customer'] = {
         'webhook_url': 'https://webhook.site/test',
-        'authorized_plates': ['KL07AB1234', 'KL07CD5678'],
+        'authorized_plates': ['KL07AB1234', 'KL07CD5678','KL21S8086'],
         'cooldown_seconds': 10,
         'cooldown_end': 0,
         'created_at': datetime.now().isoformat()
