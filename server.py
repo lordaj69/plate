@@ -1,279 +1,320 @@
 """
-Webcam Client for Railway Server Testing
-Simulates ESP32-CAM but uses your computer's webcam
-
-This sends images to YOUR Railway server for processing
+Gate Automation Cloud Server
+Runs on Railway - handles plate recognition for all customers
 """
 
-import cv2
+from flask import Flask, request, jsonify
 import requests
 import base64
-import time
 from datetime import datetime
+import os
 import json
+import time
+import re
 
-# ============= CONFIGURATION =============
-# Your Railway server URL (get this after deploying)
-RAILWAY_SERVER_URL = "https://your-app.railway.app"  # CHANGE THIS
+app = Flask(__name__)
 
-# Customer ID for testing
-CUSTOMER_ID = "test_customer"
+# Environment variables
+PLATE_RECOGNIZER_TOKEN = os.getenv('PLATE_API_TOKEN', '')
 
-# Motion simulation (manual or auto)
-AUTO_SCAN = True  # True = auto scan every few seconds, False = manual with spacebar
-SCAN_INTERVAL = 3  # seconds
+# In-memory customer database
+# In production, use a real database (PostgreSQL, MongoDB, etc.)
+customers = {}
 
-# =========================================
-
-class WebcamClient:
-    def __init__(self, server_url, customer_id):
-        self.server_url = server_url.rstrip('/')
-        self.customer_id = customer_id
-        self.last_scan_time = 0
-        
-        print("\n" + "="*60)
-        print("WEBCAM → RAILWAY SERVER TEST CLIENT")
-        print("="*60)
-        print(f"Server URL: {self.server_url}")
-        print(f"Customer ID: {self.customer_id}")
-        print(f"Mode: {'Auto-scan' if AUTO_SCAN else 'Manual'}")
-        if AUTO_SCAN:
-            print(f"Scan interval: {SCAN_INTERVAL} seconds")
-        else:
-            print("Press SPACE to scan, 'q' to quit")
-        print("="*60)
-        
-        # Test server connection
-        self.test_connection()
+def init_customers():
+    """Initialize with test customer"""
+    global customers
     
-    def test_connection(self):
-        """Test if server is reachable"""
-        print("\nTesting server connection...")
+    # Load from environment if available
+    customers_json = os.getenv('CUSTOMERS_CONFIG', '')
+    if customers_json:
         try:
-            response = requests.get(f"{self.server_url}/health", timeout=5)
-            if response.status_code == 200:
-                print("✓ Server is online and responding")
-                data = response.json()
-                print(f"  Status: {data.get('status')}")
-                print(f"  Timestamp: {data.get('timestamp')}")
-            else:
-                print(f"✗ Server responded with status {response.status_code}")
+            customers = json.loads(customers_json)
+            print(f"Loaded {len(customers)} customers from config")
+            return
+        except:
+            pass
+    
+    # Default test customer
+    customers['test_customer'] = {
+        'webhook_url': 'https://webhook.site/test',  # Use webhook.site for testing
+        'authorized_plates': ['KL07AB1234', 'KL07CD5678'],
+        'cooldown_seconds': 10,
+        'cooldown_end': 0,
+        'created_at': datetime.now().isoformat()
+    }
+    print("Initialized with test customer")
+
+# Initialize on startup
+init_customers()
+
+def clean_plate(text):
+    """Remove spaces and special characters"""
+    return re.sub(r'[^A-Z0-9]', '', str(text).upper())
+
+def fuzzy_match(detected, authorized):
+    """Check if plates match with tolerance for OCR errors"""
+    detected = clean_plate(detected)
+    authorized = clean_plate(authorized)
+    
+    # Exact match
+    if detected == authorized:
+        return True, 100
+    
+    # Partial match
+    if len(detected) >= 6 and detected in authorized:
+        return True, 80
+    
+    if len(authorized) >= 6 and authorized in detected:
+        return True, 80
+    
+    # Similarity match
+    if len(detected) > 0 and len(authorized) > 0:
+        matches = sum(1 for a, b in zip(detected, authorized) if a == b)
+        similarity = (matches / max(len(detected), len(authorized))) * 100
+        if similarity >= 70:
+            return True, similarity
+    
+    return False, 0
+
+def is_authorized(customer_id, detected_plate):
+    """Check if plate is authorized for customer"""
+    if customer_id not in customers:
+        return False, None, 0
+    
+    authorized_plates = customers[customer_id].get('authorized_plates', [])
+    
+    for auth_plate in authorized_plates:
+        is_match, confidence = fuzzy_match(detected_plate, auth_plate)
+        if is_match:
+            return True, auth_plate, confidence
+    
+    return False, None, 0
+
+def can_open_gate(customer_id):
+    """Check if cooldown period has passed"""
+    if customer_id not in customers:
+        return False
+    
+    current_time = time.time()
+    cooldown_end = customers[customer_id].get('cooldown_end', 0)
+    
+    return current_time > cooldown_end
+
+def trigger_gate(customer_id, plate):
+    """Send webhook to customer's hub"""
+    if customer_id not in customers:
+        return False
+    
+    webhook_url = customers[customer_id].get('webhook_url')
+    if not webhook_url:
+        return False
+    
+    try:
+        response = requests.post(
+            webhook_url,
+            json={
+                'plate': plate,
+                'timestamp': datetime.now().isoformat(),
+                'customer_id': customer_id
+            },
+            timeout=5
+        )
+        
+        # Set cooldown
+        cooldown_seconds = customers[customer_id].get('cooldown_seconds', 10)
+        customers[customer_id]['cooldown_end'] = time.time() + cooldown_seconds
+        
+        return response.status_code in [200, 201, 204]
+    except Exception as e:
+        print(f"Error triggering gate for {customer_id}: {e}")
+        return False
+
+@app.route('/', methods=['GET'])
+def home():
+    """API info page"""
+    return jsonify({
+        'service': 'Gate Automation Cloud Server',
+        'status': 'running',
+        'timestamp': datetime.now().isoformat(),
+        'customers': len(customers),
+        'endpoints': {
+            '/': 'GET - This info page',
+            '/health': 'GET - Health check',
+            '/detect': 'POST - Detect plate and trigger gate',
+            '/add_customer': 'POST - Add new customer',
+            '/list_customers': 'GET - List all customers'
+        }
+    })
+
+@app.route('/health', methods=['GET'])
+def health():
+    """Health check endpoint"""
+    return jsonify({
+        'status': 'healthy',
+        'timestamp': datetime.now().isoformat()
+    })
+
+@app.route('/detect', methods=['POST'])
+def detect_plate():
+    """
+    Main endpoint - receives image from ESP32-CAM or webcam
+    
+    POST JSON:
+    {
+        "image": "base64_encoded_jpeg",
+        "customer_id": "customer_abc123"
+    }
+    """
+    try:
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({'error': 'No JSON data'}), 400
+        
+        image_b64 = data.get('image')
+        customer_id = data.get('customer_id')
+        
+        if not image_b64:
+            return jsonify({'error': 'No image provided'}), 400
+        
+        if not customer_id:
+            return jsonify({'error': 'No customer_id provided'}), 400
+        
+        if customer_id not in customers:
+            return jsonify({'error': 'Unknown customer_id'}), 404
+        
+        # Check API token
+        if not PLATE_RECOGNIZER_TOKEN:
+            return jsonify({'error': 'Server not configured - missing API token'}), 500
+        
+        # Decode base64 image
+        try:
+            image_bytes = base64.b64decode(image_b64)
         except Exception as e:
-            print(f"✗ Cannot connect to server: {e}")
-            print("\nMake sure:")
-            print("1. You've deployed to Railway")
-            print("2. Updated RAILWAY_SERVER_URL in this script")
-            print("3. Server is running (check Railway dashboard)")
-            return False
+            return jsonify({'error': f'Invalid base64 image: {str(e)}'}), 400
         
-        return True
-    
-    def capture_and_encode(self, frame):
-        """Capture frame and encode to base64 (like ESP32-CAM does)"""
-        # Encode frame to JPEG
-        _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        print(f"[{customer_id}] Processing image ({len(image_bytes)} bytes)")
         
-        # Convert to base64
-        image_b64 = base64.b64encode(buffer).decode('utf-8')
-        
-        return image_b64, len(buffer)
-    
-    def send_to_server(self, image_b64, image_size):
-        """Send image to Railway server for processing"""
-        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Sending to server...")
-        print(f"  Image size: {image_size:,} bytes")
-        
+        # Call Plate Recognizer API
         try:
-            # Prepare payload (exactly like ESP32-CAM)
-            payload = {
-                "image": image_b64,
-                "customer_id": self.customer_id
-            }
-            
-            # Send POST request
             response = requests.post(
-                f"{self.server_url}/detect",
-                json=payload,
-                timeout=15  # Plate API can take 5-10 seconds
+                'https://api.platerecognizer.com/v1/plate-reader/',
+                headers={'Authorization': f'Token {PLATE_RECOGNIZER_TOKEN}'},
+                files={'upload': image_bytes},
+                timeout=15
             )
-            
-            if response.status_code == 200:
-                result = response.json()
-                self.display_result(result)
-                return result
-            else:
-                print(f"  ✗ Server error: {response.status_code}")
-                print(f"     {response.text}")
-                return None
-                
         except requests.Timeout:
-            print("  ✗ Request timed out (server might be processing)")
+            return jsonify({'error': 'Plate API timeout'}), 504
         except Exception as e:
-            print(f"  ✗ Error: {e}")
+            return jsonify({'error': f'Plate API error: {str(e)}'}), 500
         
-        return None
-    
-    def display_result(self, result):
-        """Display server response"""
-        status = result.get('status')
-        detected = result.get('detected_plates', [])
-        gate_triggered = result.get('gate_triggered', False)
-        matched_plate = result.get('matched_plate')
+        if response.status_code != 201:
+            return jsonify({
+                'error': 'Plate recognition failed',
+                'api_status': response.status_code,
+                'api_response': response.text
+            }), 500
         
-        print(f"  ✓ Server processed successfully")
+        api_result = response.json()
+        detected_plates = []
+        gate_triggered = False
+        matched_plate = None
         
-        if detected:
-            print(f"  Detected {len(detected)} plate(s):")
-            for plate_data in detected:
-                plate = plate_data.get('plate')
-                conf = plate_data.get('confidence', 0)
-                print(f"    - {plate} (confidence: {conf:.2f})")
-        else:
-            print("  No plates detected")
-        
-        if gate_triggered:
-            print("\n" + "="*60)
-            print(f"🚪🚪🚪 GATE TRIGGERED FOR: {matched_plate} 🚪🚪🚪")
-            print("="*60)
-            print("(Server sent webhook to customer's hub)")
-        else:
-            if detected:
-                print("  → Gate NOT triggered (plate not authorized)")
-    
-    def run_manual(self):
-        """Manual mode - press space to scan"""
-        cap = cv2.VideoCapture(0)
-        
-        if not cap.isOpened():
-            print("Error: Cannot open webcam")
-            return
-        
-        print("\nWebcam opened. Press SPACE to scan, 'q' to quit\n")
-        
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
+        # Process detected plates
+        for result in api_result.get('results', []):
+            plate = result.get('plate', '')
+            confidence = result.get('score', 0)
             
-            # Display live feed
-            cv2.imshow('Webcam Feed - Press SPACE to scan', frame)
+            detected_plates.append({
+                'plate': plate,
+                'confidence': confidence
+            })
             
-            key = cv2.waitKey(1) & 0xFF
+            # Check authorization
+            is_auth, auth_plate, match_conf = is_authorized(customer_id, plate)
             
-            if key == ord(' '):
-                # Capture and send
-                image_b64, size = self.capture_and_encode(frame)
-                self.send_to_server(image_b64, size)
-            
-            elif key == ord('q'):
-                break
-        
-        cap.release()
-        cv2.destroyAllWindows()
-    
-    def run_auto(self):
-        """Auto mode - scan at intervals"""
-        cap = cv2.VideoCapture(0)
-        
-        if not cap.isOpened():
-            print("Error: Cannot open webcam")
-            return
-        
-        print(f"\nWebcam opened. Auto-scanning every {SCAN_INTERVAL} seconds. Press 'q' to quit\n")
-        
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            
-            current_time = time.time()
-            
-            # Display live feed
-            cv2.imshow('Webcam Feed - Auto Scanning', frame)
-            
-            # Auto-scan at interval
-            if current_time - self.last_scan_time >= SCAN_INTERVAL:
-                self.last_scan_time = current_time
+            if is_auth and can_open_gate(customer_id) and not gate_triggered:
+                # Trigger gate
+                success = trigger_gate(customer_id, auth_plate)
                 
-                # Capture and send
-                image_b64, size = self.capture_and_encode(frame)
-                self.send_to_server(image_b64, size)
-            
-            # Check for quit
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
+                if success:
+                    gate_triggered = True
+                    matched_plate = auth_plate
+                    print(f"[{customer_id}] ✓ Gate triggered for {auth_plate}")
         
-        cap.release()
-        cv2.destroyAllWindows()
-    
-    def run(self):
-        """Start the client"""
-        if AUTO_SCAN:
-            self.run_auto()
-        else:
-            self.run_manual()
-
-def test_server_endpoints(server_url):
-    """Test all server endpoints before starting"""
-    print("\n" + "="*60)
-    print("TESTING SERVER ENDPOINTS")
-    print("="*60)
-    
-    # Test health
-    print("\n1. Testing /health endpoint...")
-    try:
-        response = requests.get(f"{server_url}/health")
-        print(f"   Status: {response.status_code}")
-        print(f"   Response: {response.json()}")
+        return jsonify({
+            'status': 'success',
+            'customer_id': customer_id,
+            'timestamp': datetime.now().isoformat(),
+            'detected_plates': detected_plates,
+            'gate_triggered': gate_triggered,
+            'matched_plate': matched_plate
+        })
+        
     except Exception as e:
-        print(f"   Error: {e}")
-    
-    # Test home
-    print("\n2. Testing / endpoint...")
-    try:
-        response = requests.get(server_url)
-        print(f"   Status: {response.status_code}")
-        data = response.json()
-        print(f"   Service: {data.get('service')}")
-        print(f"   Customers: {data.get('customers')}")
-    except Exception as e:
-        print(f"   Error: {e}")
-    
-    # Test list customers
-    print("\n3. Testing /list_customers endpoint...")
-    try:
-        response = requests.get(f"{server_url}/list_customers")
-        print(f"   Status: {response.status_code}")
-        data = response.json()
-        print(f"   Total customers: {data.get('total_customers')}")
-        for customer in data.get('customers', []):
-            print(f"   - {customer['customer_id']}: {customer['plate_count']} plates")
-    except Exception as e:
-        print(f"   Error: {e}")
-    
-    print("\n" + "="*60)
-    input("Press ENTER to start webcam client...")
+        print(f"Error in /detect: {e}")
+        return jsonify({'error': str(e)}), 500
 
-def main():
-    # Check configuration
-    if RAILWAY_SERVER_URL == "https://your-app.railway.app":
-        print("\n" + "!"*60)
-        print("ERROR: Please update RAILWAY_SERVER_URL!")
-        print("!"*60)
-        print("\nSteps:")
-        print("1. Deploy server.py to Railway")
-        print("2. Get your Railway URL (e.g., https://gate-automation-production.up.railway.app)")
-        print("3. Update RAILWAY_SERVER_URL in this script")
-        print("4. Make sure PLATE_API_TOKEN is set in Railway environment variables")
-        print()
-        return
+@app.route('/add_customer', methods=['POST'])
+def add_customer():
+    """
+    Add new customer
     
-    # Test server first
-    test_server_endpoints(RAILWAY_SERVER_URL)
-    
-    # Start client
-    client = WebcamClient(RAILWAY_SERVER_URL, CUSTOMER_ID)
-    client.run()
+    POST JSON:
+    {
+        "customer_id": "customer_abc123",
+        "webhook_url": "http://192.168.1.100:8123/api/webhook/gate",
+        "authorized_plates": ["KL07AB1234"],
+        "cooldown_seconds": 10
+    }
+    """
+    try:
+        data = request.get_json()
+        
+        customer_id = data.get('customer_id')
+        webhook_url = data.get('webhook_url')
+        authorized_plates = data.get('authorized_plates', [])
+        cooldown_seconds = data.get('cooldown_seconds', 10)
+        
+        if not customer_id or not webhook_url:
+            return jsonify({'error': 'customer_id and webhook_url required'}), 400
+        
+        customers[customer_id] = {
+            'webhook_url': webhook_url,
+            'authorized_plates': authorized_plates,
+            'cooldown_seconds': cooldown_seconds,
+            'cooldown_end': 0,
+            'created_at': datetime.now().isoformat()
+        }
+        
+        print(f"Added customer: {customer_id}")
+        
+        return jsonify({
+            'status': 'success',
+            'customer_id': customer_id,
+            'message': 'Customer added successfully'
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
-if __name__ == "__main__":
-    main()
+@app.route('/list_customers', methods=['GET'])
+def list_customers():
+    """List all customers (without sensitive data)"""
+    customer_list = []
+    for cid, data in customers.items():
+        customer_list.append({
+            'customer_id': cid,
+            'plate_count': len(data.get('authorized_plates', [])),
+            'created_at': data.get('created_at', 'unknown')
+        })
+    
+    return jsonify({
+        'total_customers': len(customers),
+        'customers': customer_list
+    })
+
+if __name__ == '__main__':
+    port = int(os.getenv('PORT', 8080))
+    app.run(host='0.0.0.0', port=port)
